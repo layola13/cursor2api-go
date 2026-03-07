@@ -91,8 +91,18 @@ func NewCursorService(cfg *config.Config) *CursorService {
 
 // ChatCompletion creates a chat completion stream for the given request.
 func (s *CursorService) ChatCompletion(ctx context.Context, request *models.ChatCompletionRequest) (<-chan interface{}, error) {
-	truncatedMessages := s.truncateMessages(request.Messages)
-	cursorMessages := models.ToCursorMessages(truncatedMessages, s.config.SystemPromptInject)
+	messages := request.Messages
+	systemPromptInject := s.config.SystemPromptInject
+
+	if models.NeedToolCallBridge(request) {
+		messages = models.NormalizeMessagesForToolBridge(messages)
+		if bridgePrompt := models.BuildToolCallBridgePrompt(request.Tools, request.Functions, request.ToolChoice, request.FunctionCall); bridgePrompt != "" {
+			systemPromptInject = mergeSystemPrompts(systemPromptInject, bridgePrompt)
+		}
+	}
+
+	truncatedMessages := s.truncateMessages(messages)
+	cursorMessages := models.ToCursorMessages(truncatedMessages, systemPromptInject)
 
 	// 获取Cursor API使用的实际模型名称
 	cursorModel := models.GetCursorModel(request.Model)
@@ -195,6 +205,20 @@ func (s *CursorService) ChatCompletion(ctx context.Context, request *models.Chat
 	}
 
 	return nil, fmt.Errorf("failed after %d attempts", maxRetries)
+}
+
+func mergeSystemPrompts(base, appendText string) string {
+	base = strings.TrimSpace(base)
+	appendText = strings.TrimSpace(appendText)
+
+	if base == "" {
+		return appendText
+	}
+	if appendText == "" {
+		return base
+	}
+
+	return base + "\n\n" + appendText
 }
 
 func (s *CursorService) consumeSSE(ctx context.Context, resp *http.Response, output chan interface{}) {

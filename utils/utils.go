@@ -110,6 +110,7 @@ func StreamChatCompletion(c *gin.Context, chatGenerator <-chan interface{}, mode
 
 	// 处理流式数据
 	ctx := c.Request.Context()
+	var usage *models.Usage
 	for {
 		select {
 		case <-ctx.Done():
@@ -119,7 +120,7 @@ func StreamChatCompletion(c *gin.Context, chatGenerator <-chan interface{}, mode
 		case data, ok := <-chatGenerator:
 			if !ok {
 				// 通道关闭，发送完成事件
-				finishEvent := models.NewChatCompletionStreamResponse(responseID, modelName, "", stringPtr("stop"))
+				finishEvent := models.NewChatCompletionStreamResponse(responseID, modelName, "", stringPtr("stop"), usage)
 				if jsonData, err := json.Marshal(finishEvent); err == nil {
 					WriteSSEEvent(c.Writer, "", string(jsonData))
 				}
@@ -131,7 +132,7 @@ func StreamChatCompletion(c *gin.Context, chatGenerator <-chan interface{}, mode
 			case string:
 				// 文本内容
 				if v != "" {
-					streamResp := models.NewChatCompletionStreamResponse(responseID, modelName, v, nil)
+					streamResp := models.NewChatCompletionStreamResponse(responseID, modelName, v, nil, nil)
 					if jsonData, err := json.Marshal(streamResp); err == nil {
 						WriteSSEEvent(c.Writer, "", string(jsonData))
 					}
@@ -139,6 +140,8 @@ func StreamChatCompletion(c *gin.Context, chatGenerator <-chan interface{}, mode
 
 			case models.Usage:
 				// 使用统计 - 通常在最后发送
+				usageCopy := v
+				usage = &usageCopy
 				continue
 
 			case error:
@@ -321,6 +324,23 @@ func ReadSSEStream(ctx context.Context, resp *http.Response, output chan<- inter
 					PromptTokens:     eventData.MessageMetadata.Usage.InputTokens,
 					CompletionTokens: eventData.MessageMetadata.Usage.OutputTokens,
 					TotalTokens:      eventData.MessageMetadata.Usage.TotalTokens,
+				}
+				if eventData.MessageMetadata.Usage.CachedInputTokens > 0 || eventData.MessageMetadata.Usage.AudioInputTokens > 0 {
+					usage.PromptTokensDetails = &models.PromptTokensDetails{
+						CachedTokens: eventData.MessageMetadata.Usage.CachedInputTokens,
+						AudioTokens:  eventData.MessageMetadata.Usage.AudioInputTokens,
+					}
+				}
+				if eventData.MessageMetadata.Usage.ReasoningOutputTokens > 0 ||
+					eventData.MessageMetadata.Usage.AudioOutputTokens > 0 ||
+					eventData.MessageMetadata.Usage.AcceptedPredictionTokens > 0 ||
+					eventData.MessageMetadata.Usage.RejectedPredictionTokens > 0 {
+					usage.CompletionTokensDetails = &models.CompletionTokensDetail{
+						ReasoningTokens:          eventData.MessageMetadata.Usage.ReasoningOutputTokens,
+						AudioTokens:              eventData.MessageMetadata.Usage.AudioOutputTokens,
+						AcceptedPredictionTokens: eventData.MessageMetadata.Usage.AcceptedPredictionTokens,
+						RejectedPredictionTokens: eventData.MessageMetadata.Usage.RejectedPredictionTokens,
+					}
 				}
 				output <- usage
 			}

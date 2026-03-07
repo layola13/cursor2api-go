@@ -6,14 +6,14 @@ services:
     container_name: cursor2api-go
     restart: unless-stopped
     ports:
-      - "8002:8002"
+      - "48000:8002"
     environment:
       # 服务器配置
       - PORT=8002
       - DEBUG=false
 
       # API 配置（⚠️ 生产环境请修改默认密钥）
-      - API_KEY=0000
+      - API_KEY=AIzaSyB6QyDNXcxRDHM7xc0Xj7ceMKKhdNvhrAo
       - MODELS=claude-sonnet-4.6
       - SYSTEM_PROMPT_INJECT=
 

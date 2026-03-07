@@ -65,3 +65,6 @@ yarn-error.log*
 
 # Docker
 .dockerignore
+.project/
+ts-tool-test/
+.context/

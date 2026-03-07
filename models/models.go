@@ -22,27 +22,34 @@ package models
 
 import (
 	"encoding/json"
+	"strings"
 	"time"
 )
 
 // ChatCompletionRequest OpenAI聊天完成请求
 type ChatCompletionRequest struct {
-	Model       string    `json:"model" binding:"required"`
-	Messages    []Message `json:"messages" binding:"required"`
-	Stream      bool      `json:"stream,omitempty"`
-	Temperature *float64  `json:"temperature,omitempty"`
-	MaxTokens   *int      `json:"max_tokens,omitempty"`
-	TopP        *float64  `json:"top_p,omitempty"`
-	Stop        []string  `json:"stop,omitempty"`
-	User        string    `json:"user,omitempty"`
+	Model             string         `json:"model" binding:"required"`
+	Messages          []Message      `json:"messages" binding:"required"`
+	Stream            bool           `json:"stream,omitempty"`
+	Temperature       *float64       `json:"temperature,omitempty"`
+	MaxTokens         *int           `json:"max_tokens,omitempty"`
+	TopP              *float64       `json:"top_p,omitempty"`
+	Stop              []string       `json:"stop,omitempty"`
+	User              string         `json:"user,omitempty"`
+	Tools             []ToolSpec     `json:"tools,omitempty"`
+	Functions         []FunctionSpec `json:"functions,omitempty"`
+	ToolChoice        interface{}    `json:"tool_choice,omitempty"`
+	FunctionCall      interface{}    `json:"function_call,omitempty"`
+	ParallelToolCalls *bool          `json:"parallel_tool_calls,omitempty"`
 }
 
 // Message 消息结构
 type Message struct {
-	Role         string        `json:"role" binding:"required"`
-	Content      interface{}   `json:"content" binding:"required"`
-	ToolCallID   *string       `json:"tool_call_id,omitempty"`
-	ToolCalls    []ToolCall    `json:"tool_calls,omitempty"`
+	Role         string      `json:"role" binding:"required"`
+	Content      interface{} `json:"content,omitempty"`
+	ToolCallID   *string     `json:"tool_call_id,omitempty"`
+	ToolCalls    []ToolCall  `json:"tool_calls,omitempty"`
+	FunctionCall *Function   `json:"function_call,omitempty"`
 }
 
 // ToolCall 工具调用结构
@@ -56,6 +63,19 @@ type ToolCall struct {
 type Function struct {
 	Name      string `json:"name"`
 	Arguments string `json:"arguments"`
+}
+
+// ToolSpec 工具定义结构
+type ToolSpec struct {
+	Type     string       `json:"type"`
+	Function FunctionSpec `json:"function"`
+}
+
+// FunctionSpec 函数定义结构
+type FunctionSpec struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description,omitempty"`
+	Parameters  json.RawMessage `json:"parameters,omitempty"`
 }
 
 // ContentPart 消息内容部分（用于多模态内容）
@@ -82,6 +102,7 @@ type ChatCompletionStreamResponse struct {
 	Created int64          `json:"created"`
 	Model   string         `json:"model"`
 	Choices []StreamChoice `json:"choices"`
+	Usage   *Usage         `json:"usage,omitempty"`
 }
 
 // Choice 选择结构
@@ -93,22 +114,53 @@ type Choice struct {
 
 // StreamChoice 流式选择结构
 type StreamChoice struct {
-	Index        int            `json:"index"`
-	Delta        StreamDelta    `json:"delta"`
-	FinishReason *string        `json:"finish_reason"`
+	Index        int         `json:"index"`
+	Delta        StreamDelta `json:"delta"`
+	FinishReason *string     `json:"finish_reason"`
 }
 
 // StreamDelta 流式增量数据
 type StreamDelta struct {
-	Role    string `json:"role,omitempty"`
-	Content string `json:"content,omitempty"`
+	Role      string           `json:"role,omitempty"`
+	Content   string           `json:"content,omitempty"`
+	ToolCalls []StreamToolCall `json:"tool_calls,omitempty"`
+}
+
+// StreamToolCall 流式 tool_calls 增量结构
+type StreamToolCall struct {
+	Index    int                  `json:"index"`
+	ID       string               `json:"id,omitempty"`
+	Type     string               `json:"type,omitempty"`
+	Function *StreamFunctionDelta `json:"function,omitempty"`
+}
+
+// StreamFunctionDelta 流式 function 增量结构
+type StreamFunctionDelta struct {
+	Name      string `json:"name,omitempty"`
+	Arguments string `json:"arguments,omitempty"`
 }
 
 // Usage 使用统计
 type Usage struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	TotalTokens      int `json:"total_tokens"`
+	PromptTokens            int                     `json:"prompt_tokens"`
+	CompletionTokens        int                     `json:"completion_tokens"`
+	TotalTokens             int                     `json:"total_tokens"`
+	PromptTokensDetails     *PromptTokensDetails    `json:"prompt_tokens_details,omitempty"`
+	CompletionTokensDetails *CompletionTokensDetail `json:"completion_tokens_details,omitempty"`
+}
+
+// PromptTokensDetails 输入 token 明细
+type PromptTokensDetails struct {
+	CachedTokens int `json:"cached_tokens,omitempty"`
+	AudioTokens  int `json:"audio_tokens,omitempty"`
+}
+
+// CompletionTokensDetail 输出 token 明细
+type CompletionTokensDetail struct {
+	ReasoningTokens          int `json:"reasoning_tokens,omitempty"`
+	AudioTokens              int `json:"audio_tokens,omitempty"`
+	AcceptedPredictionTokens int `json:"accepted_prediction_tokens,omitempty"`
+	RejectedPredictionTokens int `json:"rejected_prediction_tokens,omitempty"`
 }
 
 // Model 模型信息
@@ -141,8 +193,8 @@ type ErrorDetail struct {
 
 // CursorMessage Cursor消息格式
 type CursorMessage struct {
-	Role  string        `json:"role"`
-	Parts []CursorPart  `json:"parts"`
+	Role  string       `json:"role"`
+	Parts []CursorPart `json:"parts"`
 }
 
 // CursorPart Cursor消息部分
@@ -175,9 +227,15 @@ type CursorMessageMetadata struct {
 
 // CursorUsage Cursor使用统计
 type CursorUsage struct {
-	InputTokens  int `json:"inputTokens"`
-	OutputTokens int `json:"outputTokens"`
-	TotalTokens  int `json:"totalTokens"`
+	InputTokens              int `json:"inputTokens"`
+	OutputTokens             int `json:"outputTokens"`
+	TotalTokens              int `json:"totalTokens"`
+	CachedInputTokens        int `json:"cachedInputTokens,omitempty"`
+	AudioInputTokens         int `json:"audioInputTokens,omitempty"`
+	ReasoningOutputTokens    int `json:"reasoningOutputTokens,omitempty"`
+	AudioOutputTokens        int `json:"audioOutputTokens,omitempty"`
+	AcceptedPredictionTokens int `json:"acceptedPredictionTokens,omitempty"`
+	RejectedPredictionTokens int `json:"rejectedPredictionTokens,omitempty"`
 }
 
 // SSEEvent 服务器发送事件
@@ -305,8 +363,34 @@ func NewChatCompletionResponse(id, model, content string, usage Usage) *ChatComp
 	}
 }
 
+// NewChatCompletionToolCallResponse 创建包含 tool_calls 的聊天完成响应
+func NewChatCompletionToolCallResponse(id, model string, toolCalls []ToolCall, content string, usage Usage) *ChatCompletionResponse {
+	message := Message{
+		Role:      "assistant",
+		ToolCalls: toolCalls,
+	}
+	if strings.TrimSpace(content) != "" {
+		message.Content = content
+	}
+
+	return &ChatCompletionResponse{
+		ID:      id,
+		Object:  "chat.completion",
+		Created: time.Now().Unix(),
+		Model:   model,
+		Choices: []Choice{
+			{
+				Index:        0,
+				Message:      message,
+				FinishReason: "tool_calls",
+			},
+		},
+		Usage: usage,
+	}
+}
+
 // NewChatCompletionStreamResponse 创建流式响应
-func NewChatCompletionStreamResponse(id, model, content string, finishReason *string) *ChatCompletionStreamResponse {
+func NewChatCompletionStreamResponse(id, model, content string, finishReason *string, usage *Usage) *ChatCompletionStreamResponse {
 	return &ChatCompletionStreamResponse{
 		ID:      id,
 		Object:  "chat.completion.chunk",
@@ -321,6 +405,7 @@ func NewChatCompletionStreamResponse(id, model, content string, finishReason *st
 				FinishReason: finishReason,
 			},
 		},
+		Usage: usage,
 	}
 }
 

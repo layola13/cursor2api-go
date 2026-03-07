@@ -26,8 +26,10 @@ import (
 	"cursor2api-go/models"
 	"cursor2api-go/services"
 	"cursor2api-go/utils"
+	"encoding/json"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -238,6 +240,19 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	// 验证并调整max_tokens参数
 	request.MaxTokens = models.ValidateMaxTokens(request.Model, request.MaxTokens)
 
+	// 非流式 + tool bridge: 如果模型未按 XML 输出工具调用，自动追加纠正提示并重试。
+	if !request.Stream && models.NeedToolCallBridge(&request) {
+		if handled := h.handleNonStreamToolBridgeWithRetry(c, &request); handled {
+			return
+		}
+	}
+	// 流式 + tool bridge: 首轮失败不向客户端输出，先在服务端缓存并重试，成功后再返回。
+	if request.Stream && models.NeedToolCallBridge(&request) {
+		if handled := h.handleStreamToolBridgeWithRetry(c, &request); handled {
+			return
+		}
+	}
+
 	// 调用Cursor服务
 	chatGenerator, err := h.cursorService.ChatCompletion(c.Request.Context(), &request)
 	if err != nil {
@@ -251,6 +266,249 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		utils.SafeStreamWrapper(utils.StreamChatCompletion, c, chatGenerator, request.Model)
 	} else {
 		utils.NonStreamChatCompletion(c, chatGenerator, request.Model)
+	}
+}
+
+func (h *Handler) handleNonStreamToolBridgeWithRetry(c *gin.Context, request *models.ChatCompletionRequest) bool {
+	const maxToolBridgeRetries = 2
+
+	messages := append([]models.Message(nil), request.Messages...)
+	var lastUsage models.Usage
+	var lastContent string
+
+	for attempt := 0; attempt <= maxToolBridgeRetries; attempt++ {
+		attemptReq := *request
+		attemptReq.Messages = append([]models.Message(nil), messages...)
+		attemptReq.Stream = false
+
+		chatGenerator, err := h.cursorService.ChatCompletion(c.Request.Context(), &attemptReq)
+		if err != nil {
+			logrus.WithError(err).Error("Failed to create chat completion during tool bridge retry")
+			middleware.HandleError(c, err)
+			return true
+		}
+
+		content, usage, err := collectNonStreamResult(c, chatGenerator)
+		if err != nil {
+			middleware.HandleError(c, err)
+			return true
+		}
+
+		lastContent = content
+		lastUsage = usage
+
+		if models.ContainsXMLToolCall(content, attemptReq.Tools, attemptReq.Functions) {
+			responseID := utils.GenerateChatCompletionID()
+			if toolCalls, textContent, ok := buildOpenAIToolCallsFromXML(content, attemptReq.Tools, attemptReq.Functions); ok {
+				response := models.NewChatCompletionToolCallResponse(responseID, request.Model, toolCalls, textContent, usage)
+				c.JSON(http.StatusOK, response)
+				return true
+			}
+			response := models.NewChatCompletionResponse(responseID, request.Model, content, usage)
+			c.JSON(http.StatusOK, response)
+			return true
+		}
+
+		if attempt == maxToolBridgeRetries {
+			break
+		}
+
+		// Roo-style: 把上一次 assistant 的非工具回复加入上下文，并注入“必须调用工具”的纠正消息
+		if strings.TrimSpace(content) != "" {
+			messages = append(messages, models.Message{Role: "assistant", Content: content})
+		}
+		messages = append(messages, models.Message{
+			Role:    "user",
+			Content: models.BuildNoToolsUsedRetryPrompt(attemptReq.Tools, attemptReq.Functions),
+		})
+	}
+
+	responseID := utils.GenerateChatCompletionID()
+	response := models.NewChatCompletionResponse(responseID, request.Model, lastContent, lastUsage)
+	c.JSON(http.StatusOK, response)
+	return true
+}
+
+func (h *Handler) handleStreamToolBridgeWithRetry(c *gin.Context, request *models.ChatCompletionRequest) bool {
+	const maxToolBridgeRetries = 2
+
+	messages := append([]models.Message(nil), request.Messages...)
+	var lastUsage models.Usage
+	var lastContent string
+
+	for attempt := 0; attempt <= maxToolBridgeRetries; attempt++ {
+		attemptReq := *request
+		attemptReq.Messages = append([]models.Message(nil), messages...)
+		attemptReq.Stream = true
+
+		chatGenerator, err := h.cursorService.ChatCompletion(c.Request.Context(), &attemptReq)
+		if err != nil {
+			logrus.WithError(err).Error("Failed to create stream chat completion during tool bridge retry")
+			middleware.HandleError(c, err)
+			return true
+		}
+
+		// 缓存本轮流式输出，避免首轮失败内容提前发给客户端。
+		content, usage, err := collectNonStreamResult(c, chatGenerator)
+		if err != nil {
+			middleware.HandleError(c, err)
+			return true
+		}
+
+		lastContent = content
+		lastUsage = usage
+
+		if models.ContainsXMLToolCall(content, attemptReq.Tools, attemptReq.Functions) {
+			if toolCalls, textContent, ok := buildOpenAIToolCallsFromXML(content, attemptReq.Tools, attemptReq.Functions); ok {
+				streamBufferedToolCallResponse(c, request.Model, textContent, toolCalls, usage)
+				return true
+			}
+			streamBufferedTextResponse(c, request.Model, content, usage)
+			return true
+		}
+
+		if attempt == maxToolBridgeRetries {
+			break
+		}
+
+		if strings.TrimSpace(content) != "" {
+			messages = append(messages, models.Message{Role: "assistant", Content: content})
+		}
+		messages = append(messages, models.Message{
+			Role:    "user",
+			Content: models.BuildNoToolsUsedRetryPrompt(attemptReq.Tools, attemptReq.Functions),
+		})
+	}
+
+	streamBufferedTextResponse(c, request.Model, lastContent, lastUsage)
+	return true
+}
+
+func buildOpenAIToolCallsFromXML(content string, tools []models.ToolSpec, functions []models.FunctionSpec) ([]models.ToolCall, string, bool) {
+	parsedFunctions, ok := models.ExtractXMLToolCalls(content, tools, functions)
+	if !ok || len(parsedFunctions) == 0 {
+		return nil, "", false
+	}
+
+	toolCalls := make([]models.ToolCall, 0, len(parsedFunctions))
+	for _, fn := range parsedFunctions {
+		toolCalls = append(toolCalls, models.ToolCall{
+			ID:       "call_" + utils.GenerateRandomString(24),
+			Type:     "function",
+			Function: fn,
+		})
+	}
+
+	textContent := models.ExtractNonToolTextFromXMLContent(content, tools, functions)
+	return toolCalls, textContent, true
+}
+
+func streamBufferedTextResponse(c *gin.Context, model, content string, usage models.Usage) {
+	buffered := make(chan interface{}, 2)
+	if strings.TrimSpace(content) != "" {
+		buffered <- content
+	}
+	buffered <- usage
+	close(buffered)
+	utils.StreamChatCompletion(c, buffered, model)
+}
+
+func streamBufferedToolCallResponse(c *gin.Context, model, content string, toolCalls []models.ToolCall, usage models.Usage) {
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+	c.Header("Access-Control-Allow-Origin", "*")
+
+	responseID := utils.GenerateChatCompletionID()
+
+	writeChunk := func(delta models.StreamDelta, finishReason *string, usagePayload *models.Usage) bool {
+		chunk := models.ChatCompletionStreamResponse{
+			ID:      responseID,
+			Object:  "chat.completion.chunk",
+			Created: time.Now().Unix(),
+			Model:   model,
+			Choices: []models.StreamChoice{
+				{
+					Index:        0,
+					Delta:        delta,
+					FinishReason: finishReason,
+				},
+			},
+			Usage: usagePayload,
+		}
+		jsonData, err := json.Marshal(chunk)
+		if err != nil {
+			logrus.WithError(err).Error("Failed to marshal stream tool_call chunk")
+			return false
+		}
+		if err := utils.WriteSSEEvent(c.Writer, "", string(jsonData)); err != nil {
+			logrus.WithError(err).Error("Failed to write stream tool_call chunk")
+			return false
+		}
+		return true
+	}
+
+	if !writeChunk(models.StreamDelta{Role: "assistant"}, nil, nil) {
+		return
+	}
+
+	if strings.TrimSpace(content) != "" {
+		if !writeChunk(models.StreamDelta{Content: content}, nil, nil) {
+			return
+		}
+	}
+
+	for idx, tc := range toolCalls {
+		delta := models.StreamDelta{
+			ToolCalls: []models.StreamToolCall{
+				{
+					Index: idx,
+					ID:    tc.ID,
+					Type:  tc.Type,
+					Function: &models.StreamFunctionDelta{
+						Name:      tc.Function.Name,
+						Arguments: tc.Function.Arguments,
+					},
+				},
+			},
+		}
+		if !writeChunk(delta, nil, nil) {
+			return
+		}
+	}
+
+	finishReason := "tool_calls"
+	usageCopy := usage
+	if !writeChunk(models.StreamDelta{}, &finishReason, &usageCopy) {
+		return
+	}
+	if err := utils.WriteSSEEvent(c.Writer, "", "[DONE]"); err != nil {
+		logrus.WithError(err).Error("Failed to write stream DONE event")
+	}
+}
+
+func collectNonStreamResult(c *gin.Context, chatGenerator <-chan interface{}) (string, models.Usage, error) {
+	var fullContent strings.Builder
+	var usage models.Usage
+
+	ctx := c.Request.Context()
+	for {
+		select {
+		case <-ctx.Done():
+			return "", usage, middleware.NewCursorWebError(http.StatusRequestTimeout, "request timeout")
+		case data, ok := <-chatGenerator:
+			if !ok {
+				return fullContent.String(), usage, nil
+			}
+			switch v := data.(type) {
+			case string:
+				fullContent.WriteString(v)
+			case models.Usage:
+				usage = v
+			case error:
+				return "", usage, v
+			}
+		}
 	}
 }
 
