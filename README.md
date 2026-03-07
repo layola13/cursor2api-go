@@ -213,6 +213,82 @@ curl -X POST http://localhost:8002/v1/chat/completions \
 2. **API 密钥**: `0000`（或自定义）
 3. **模型**: 选择支持的模型之一
 
+## 🧩 XML 工具桥接改造记录（2026-03）
+
+本次改造的目标是：在**不修改客户端 OpenAI function/tool 请求格式**的前提下，服务端拦截并桥接为 XML 协议与 Cursor 对话，最后再转换回标准 OpenAI 响应，让客户端无感。
+
+### 改造步骤与过程
+
+1. **请求侧保持 OpenAI 标准**
+- 客户端继续发送 `tools` / `tool_choice` / `function_call`，不做改动。
+
+2. **服务端自动注入 XML 桥接提示词**
+- 检测到工具调用请求后，自动注入 Roo 风格 XML 规则，要求模型以 XML 形式调用工具（支持参数子标签、CDATA、多工具 `<tool_calls>` 包裹等）。
+- 同时把历史 `assistant.tool_calls`、`tool`/`function` 消息规范化为可供模型理解的 XML 文本上下文，避免信息丢失。
+
+3. **失败重试（不把失败结果返回客户端）**
+- 当模型首轮未使用工具时，服务端注入纠正提示（`[ERROR] You did not use a tool...`）并重试，最多 2 次。
+- 对 `stream=true` 请求，首轮失败内容在服务端缓存，不提前下发给客户端。
+
+4. **响应回转为标准 OpenAI 格式**
+- 非流式：将 XML 工具调用解析为 `choices[0].message.tool_calls`，`finish_reason="tool_calls"`。
+- 流式：将 XML 工具调用转换为标准 SSE `delta.tool_calls`，不再把 XML 原文返回给客户端。
+- 若模型在 XML 之外还输出普通说明文本，会保留并返回：
+  - 非流式：`message.content`
+  - 流式：`delta.content`
+
+### 当前行为说明
+
+- **非流式工具调用**：返回 OpenAI 标准 `tool_calls`，可附带文本说明。
+- **流式工具调用**：返回 OpenAI 标准增量 `delta.tool_calls`（无 XML 标签泄漏），可附带 `delta.content`。
+- **普通对话（无 tools）**：保持原有文本对话流程，不走 XML 桥接。
+
+### 关键代码位置
+
+- `models/tool_bridge.go`：
+  - `BuildToolCallBridgePrompt`
+  - `NormalizeMessagesForToolBridge`
+  - `ExtractXMLToolCalls`
+  - `ExtractNonToolTextFromXMLContent`
+- `services/cursor.go`：
+  - 在发往 Cursor 前启用桥接消息与系统提示注入
+- `handlers/handler.go`：
+  - `handleNonStreamToolBridgeWithRetry`
+  - `handleStreamToolBridgeWithRetry`
+  - `streamBufferedToolCallResponse`
+- `models/models.go`：
+  - 新增流式 `delta.tool_calls` 数据结构
+  - `NewChatCompletionToolCallResponse` 支持 `tool_calls + content`
+
+### 验证方式（示例）
+
+1. **Go 单元测试**
+```bash
+go test ./...
+```
+
+2. **流式验证（检查返回是否为标准 tool_calls）**
+```bash
+curl -sN http://127.0.0.1:8002/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer 0000" \
+  -d '{
+    "model":"claude-sonnet-4.6",
+    "stream":true,
+    "tool_choice":"required",
+    "messages":[{"role":"user","content":"用c++写个简单的排序,保存到本地，然后执行编译测试"}],
+    "tools":[
+      {"type":"function","function":{"name":"write_file","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}},
+      {"type":"function","function":{"name":"run_command","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}}
+    ]
+  }'
+```
+- 期望：SSE chunk 出现 `delta.tool_calls`，不出现 `<tool_calls>` XML 原文。
+
+3. **TypeScript 客户端回放测试**
+- 测试脚本：`ts-tool-test/tool-call-loop.ts`
+- 该脚本会模拟 OpenAI 客户端工具循环，验证文件写入和编译命令执行。
+
 ## ⚙️ 配置说明
 
 ### 环境变量
