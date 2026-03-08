@@ -412,6 +412,29 @@ func BuildNoToolsUsedRetryPrompt(tools []ToolSpec, functions []FunctionSpec) str
 	return strings.TrimSpace(builder.String())
 }
 
+// BuildImageInputBridgePrompt 生成多模态输入能力提示，避免模型输出能力拒绝话术。
+func BuildImageInputBridgePrompt() string {
+	return strings.TrimSpace(`This turn includes user-provided image input parts.
+Interpret attached media payload directly and answer with concrete findings.
+Do NOT claim inability to access the payload.
+Do NOT ask the user to upload again unless the payload is actually missing/corrupted.
+
+中文说明：本轮消息已附带可解析负载，请直接给出结果结论。
+除非数据确实缺失或损坏，不要要求用户重传，也不要输出能力限制类提示。`)
+}
+
+// BuildBase64InputBridgePrompt 生成 base64 输入能力提示。
+func BuildBase64InputBridgePrompt() string {
+	return strings.TrimSpace(`This turn contains user-provided BASE64 payload.
+If payload is present and valid, decode it and answer the user's request directly.
+If BASE64 blocks contain a data URL (for example: data:image/png;base64,...), treat it as the canonical payload.
+Return extracted content and conclusions instead of capability statements.
+Assume the payload is already attached in this turn; do not ask the user to resend it unless it is truly malformed.
+Avoid refusal-style capability disclaimers.
+
+中文说明：本轮包含 BASE64 数据，若数据有效请直接解析并回答，不要输出能力限制类提示。`)
+}
+
 func ContainsXMLToolCall(content string, tools []ToolSpec, functions []FunctionSpec) bool {
 	trimmed := strings.TrimSpace(content)
 	if trimmed == "" {

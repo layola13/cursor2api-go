@@ -27,6 +27,7 @@ import (
 	"cursor2api-go/services"
 	"cursor2api-go/utils"
 	"encoding/json"
+	"io"
 	"net/http"
 	"os"
 	"strings"
@@ -207,7 +208,17 @@ func (h *Handler) ListModels(c *gin.Context) {
 // ChatCompletions 处理聊天完成请求
 func (h *Handler) ChatCompletions(c *gin.Context) {
 	var request models.ChatCompletionRequest
-	if err := c.ShouldBindJSON(&request); err != nil {
+	rawBody, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		logrus.WithError(err).Error("Failed to read request body")
+		c.JSON(http.StatusBadRequest, models.NewErrorResponse(
+			"Invalid request format",
+			"invalid_request_error",
+			"invalid_json",
+		))
+		return
+	}
+	if err := json.Unmarshal(rawBody, &request); err != nil {
 		logrus.WithError(err).Error("Failed to bind request")
 		c.JSON(http.StatusBadRequest, models.NewErrorResponse(
 			"Invalid request format",
@@ -215,6 +226,12 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			"invalid_json",
 		))
 		return
+	}
+	if !models.HasImageContent(request.Messages) {
+		if imageCandidates := models.ExtractImageCandidatesFromRawRequest(rawBody); len(imageCandidates) > 0 {
+			request.Messages = models.InjectImageCandidatesIntoMessages(request.Messages, imageCandidates)
+			logrus.WithField("image_candidates", len(imageCandidates)).Info("Recovered image payloads from raw request")
+		}
 	}
 
 	// 验证模型

@@ -118,6 +118,143 @@ func TestToCursorMessages(t *testing.T) {
 	}
 }
 
+func TestToCursorMessagesWithImageParts(t *testing.T) {
+	messages := []Message{
+		{
+			Role: "user",
+			Content: []interface{}{
+				map[string]interface{}{
+					"type": "text",
+					"text": "请识别图片",
+				},
+				map[string]interface{}{
+					"type": "image_url",
+					"image_url": map[string]interface{}{
+						"url": "data:image/png;base64,AAAABBBB",
+					},
+				},
+			},
+		},
+	}
+
+	result := ToCursorMessages(messages, "")
+	if len(result) != 1 {
+		t.Fatalf("ToCursorMessages() len = %d, want 1", len(result))
+	}
+	if len(result[0].Parts) != 2 {
+		t.Fatalf("ToCursorMessages() parts len = %d, want 2", len(result[0].Parts))
+	}
+	if result[0].Parts[0].Type != "text" || result[0].Parts[0].Text != "请识别图片" {
+		t.Fatalf("unexpected text part: %#v", result[0].Parts[0])
+	}
+	if result[0].Parts[1].Type != "image_url" || result[0].Parts[1].ImageURL == nil {
+		t.Fatalf("unexpected image part: %#v", result[0].Parts[1])
+	}
+	if result[0].Parts[1].ImageURL.URL != "data:image/png;base64,AAAABBBB" {
+		t.Fatalf("unexpected image url: %#v", result[0].Parts[1])
+	}
+}
+
+func TestToCursorMessagesWithMessageLevelImages(t *testing.T) {
+	messages := []Message{
+		{
+			Role:    "user",
+			Content: "请评估这张图",
+			Images:  []string{"https://example.com/a.png"},
+		},
+	}
+
+	result := ToCursorMessages(messages, "")
+	if len(result) != 1 {
+		t.Fatalf("ToCursorMessages() len = %d, want 1", len(result))
+	}
+	if len(result[0].Parts) != 2 {
+		t.Fatalf("ToCursorMessages() parts len = %d, want 2", len(result[0].Parts))
+	}
+	if result[0].Parts[1].ImageURL == nil || result[0].Parts[1].ImageURL.URL != "https://example.com/a.png" {
+		t.Fatalf("unexpected image url part: %#v", result[0].Parts[1])
+	}
+}
+
+func TestHasImageContent(t *testing.T) {
+	messagesWithImage := []Message{
+		{
+			Role: "user",
+			Content: []interface{}{
+				map[string]interface{}{
+					"type": "text",
+					"text": "OCR",
+				},
+				map[string]interface{}{
+					"type": "image_url",
+					"image_url": map[string]interface{}{
+						"url": "data:image/png;base64,AAAA",
+					},
+				},
+			},
+		},
+	}
+	if !HasImageContent(messagesWithImage) {
+		t.Fatalf("HasImageContent() = false, want true")
+	}
+
+	messagesWithImageField := []Message{
+		{
+			Role:     "user",
+			Content:  "hello",
+			ImageURL: map[string]interface{}{"url": "https://example.com/b.jpg"},
+		},
+	}
+	if !HasImageContent(messagesWithImageField) {
+		t.Fatalf("HasImageContent() with message-level fields = false, want true")
+	}
+
+	messagesNoImage := []Message{
+		{
+			Role:    "user",
+			Content: "hello",
+		},
+	}
+	if HasImageContent(messagesNoImage) {
+		t.Fatalf("HasImageContent() = true, want false")
+	}
+}
+
+func TestExtractImageCandidatesFromRawRequest(t *testing.T) {
+	raw := []byte(`{
+		"model":"x",
+		"messages":[
+			{"role":"user","content":"请分析","attachments":[{"type":"image","image":"AAAA","mediaType":"image/png"}]}
+		]
+	}`)
+
+	urls := ExtractImageCandidatesFromRawRequest(raw)
+	if len(urls) == 0 {
+		t.Fatalf("ExtractImageCandidatesFromRawRequest() returned empty")
+	}
+	if urls[0] != "data:image/png;base64,AAAA" {
+		t.Fatalf("unexpected extracted url: %v", urls[0])
+	}
+}
+
+func TestInjectImageCandidatesIntoMessages(t *testing.T) {
+	msgs := []Message{
+		{Role: "user", Content: "请评估这张图"},
+	}
+	out := InjectImageCandidatesIntoMessages(msgs, []string{"data:image/png;base64,AAAA"})
+	if len(out) != 1 {
+		t.Fatalf("unexpected message count: %d", len(out))
+	}
+
+	parts, ok := out[0].Content.([]interface{})
+	if !ok {
+		t.Fatalf("expected []interface{} content, got %#v", out[0].Content)
+	}
+	if len(parts) != 2 {
+		t.Fatalf("expected 2 parts, got %d", len(parts))
+	}
+}
+
 func TestNewChatCompletionResponse(t *testing.T) {
 	response := NewChatCompletionResponse("test-id", "gpt-4o", "Hello world", Usage{PromptTokens: 10, CompletionTokens: 5, TotalTokens: 15})
 
@@ -378,6 +515,26 @@ func TestBuildNoToolsUsedRetryPrompt(t *testing.T) {
 	}
 	if !strings.Contains(prompt, "<run_command>") {
 		t.Errorf("retry prompt missing tool list: %s", prompt)
+	}
+}
+
+func TestBuildImageInputBridgePrompt(t *testing.T) {
+	prompt := BuildImageInputBridgePrompt()
+	if prompt == "" {
+		t.Fatalf("BuildImageInputBridgePrompt() should not be empty")
+	}
+	if !strings.Contains(prompt, "Interpret attached media payload directly") {
+		t.Fatalf("image bridge prompt missing expected guidance: %s", prompt)
+	}
+}
+
+func TestBuildBase64InputBridgePrompt(t *testing.T) {
+	prompt := BuildBase64InputBridgePrompt()
+	if prompt == "" {
+		t.Fatalf("BuildBase64InputBridgePrompt() should not be empty")
+	}
+	if !strings.Contains(prompt, "contains user-provided BASE64 payload") {
+		t.Fatalf("base64 bridge prompt missing expected guidance: %s", prompt)
 	}
 }
 

@@ -45,11 +45,16 @@ type ChatCompletionRequest struct {
 
 // Message 消息结构
 type Message struct {
-	Role         string      `json:"role" binding:"required"`
-	Content      interface{} `json:"content,omitempty"`
-	ToolCallID   *string     `json:"tool_call_id,omitempty"`
-	ToolCalls    []ToolCall  `json:"tool_calls,omitempty"`
-	FunctionCall *Function   `json:"function_call,omitempty"`
+	Role         string        `json:"role" binding:"required"`
+	Content      interface{}   `json:"content,omitempty"`
+	Images       []string      `json:"images,omitempty"`
+	Attachments  []interface{} `json:"attachments,omitempty"`
+	Files        []interface{} `json:"files,omitempty"`
+	ImageURL     interface{}   `json:"image_url,omitempty"`
+	InputImage   interface{}   `json:"input_image,omitempty"`
+	ToolCallID   *string       `json:"tool_call_id,omitempty"`
+	ToolCalls    []ToolCall    `json:"tool_calls,omitempty"`
+	FunctionCall *Function     `json:"function_call,omitempty"`
 }
 
 // ToolCall 工具调用结构
@@ -80,9 +85,13 @@ type FunctionSpec struct {
 
 // ContentPart 消息内容部分（用于多模态内容）
 type ContentPart struct {
-	Type string `json:"type"`
-	Text string `json:"text,omitempty"`
-	URL  string `json:"url,omitempty"`
+	Type      string                 `json:"type"`
+	Text      string                 `json:"text,omitempty"`
+	URL       string                 `json:"url,omitempty"`
+	ImageURL  map[string]interface{} `json:"image_url,omitempty"`
+	Image     string                 `json:"image,omitempty"`
+	MediaType string                 `json:"mediaType,omitempty"`
+	Source    map[string]interface{} `json:"source,omitempty"`
 }
 
 // ChatCompletionResponse OpenAI聊天完成响应
@@ -197,10 +206,27 @@ type CursorMessage struct {
 	Parts []CursorPart `json:"parts"`
 }
 
+// CursorImageURL Cursor图片URL结构
+type CursorImageURL struct {
+	URL string `json:"url"`
+}
+
+// CursorImageSource Cursor图片base64数据结构（Anthropic风格）
+type CursorImageSource struct {
+	Type          string `json:"type"`
+	MediaType     string `json:"media_type,omitempty"`
+	MediaTypeAlt  string `json:"mediaType,omitempty"`
+	Data          string `json:"data"`
+}
+
 // CursorPart Cursor消息部分
 type CursorPart struct {
-	Type string `json:"type"`
-	Text string `json:"text"`
+	Type      string             `json:"type"`
+	Text      string             `json:"text,omitempty"`
+	ImageURL  *CursorImageURL    `json:"image_url,omitempty"`
+	Source    *CursorImageSource `json:"source,omitempty"`
+	Image     string             `json:"image,omitempty"`
+	MediaType string             `json:"mediaType,omitempty"`
 }
 
 // CursorRequest Cursor请求格式
@@ -267,10 +293,8 @@ func (m *Message) GetStringContent() string {
 		var text string
 		for _, item := range content {
 			if part, ok := item.(map[string]interface{}); ok {
-				if partType, exists := part["type"].(string); exists && partType == "text" {
-					if textContent, exists := part["text"].(string); exists {
-						text += textContent
-					}
+				if partType, exists := part["type"].(string); exists && (partType == "text" || partType == "input_text") {
+					text += strings.TrimSpace(toString(part["text"]))
 				}
 			}
 		}
@@ -292,8 +316,12 @@ func ToCursorMessages(messages []Message, systemPromptInject string) []CursorMes
 	if systemPromptInject != "" {
 		if len(messages) > 0 && messages[0].Role == "system" {
 			// 如果第一条已经是系统消息，追加注入内容
-			content := messages[0].GetStringContent()
-			content += "\n" + systemPromptInject
+			content := strings.TrimSpace(messages[0].GetStringContent())
+			if content == "" {
+				content = systemPromptInject
+			} else {
+				content += "\n" + systemPromptInject
+			}
 			result = append(result, CursorMessage{
 				Role: "system",
 				Parts: []CursorPart{
@@ -328,18 +356,382 @@ func ToCursorMessages(messages []Message, systemPromptInject string) []CursorMes
 		}
 
 		cursorMsg := CursorMessage{
-			Role: msg.Role,
-			Parts: []CursorPart{
-				{
-					Type: "text",
-					Text: msg.GetStringContent(),
-				},
-			},
+			Role:  msg.Role,
+			Parts: messageToCursorParts(msg),
 		}
 		result = append(result, cursorMsg)
 	}
 
 	return result
+}
+
+// HasImageContent 判断消息列表中是否包含图片输入
+func HasImageContent(messages []Message) bool {
+	for _, msg := range messages {
+		if messageHasImage(msg) {
+			return true
+		}
+	}
+	return false
+}
+
+func messageHasImage(msg Message) bool {
+	if len(collectMessageLevelImageURLs(msg)) > 0 {
+		return true
+	}
+
+	if msg.Content == nil {
+		return false
+	}
+
+	switch content := msg.Content.(type) {
+	case []ContentPart:
+		for _, part := range content {
+			partType := strings.ToLower(strings.TrimSpace(part.Type))
+			if partType == "image_url" || partType == "input_image" || partType == "image" {
+				return true
+			}
+			if strings.TrimSpace(part.URL) != "" {
+				return true
+			}
+			if len(part.ImageURL) > 0 {
+				return true
+			}
+			if strings.TrimSpace(part.Image) != "" {
+				return true
+			}
+			if len(part.Source) > 0 {
+				return true
+			}
+		}
+	case []interface{}:
+		for _, item := range content {
+			part, ok := item.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			partType := strings.ToLower(strings.TrimSpace(toString(part["type"])))
+			if partType == "image_url" || partType == "input_image" || partType == "image" {
+				return true
+			}
+			if _, ok := part["image_url"]; ok {
+				return true
+			}
+			if _, ok := part["source"]; ok {
+				return true
+			}
+			if _, ok := part["image"]; ok {
+				return true
+			}
+			if _, ok := part["input_image"]; ok {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+func messageToCursorParts(msg Message) []CursorPart {
+	parts := make([]CursorPart, 0, 4)
+
+	switch content := msg.Content.(type) {
+	case string:
+		if strings.TrimSpace(content) != "" {
+			parts = append(parts, CursorPart{Type: "text", Text: content})
+		}
+
+	case []ContentPart:
+		for _, part := range content {
+			switch strings.ToLower(strings.TrimSpace(part.Type)) {
+			case "text", "input_text":
+				if strings.TrimSpace(part.Text) != "" {
+					parts = append(parts, CursorPart{Type: "text", Text: part.Text})
+				}
+			case "image_url", "input_image", "image":
+				if url := extractImageURLFromContentPart(part); url != "" {
+					parts = append(parts, CursorPart{
+						Type:     "image_url",
+						ImageURL: &CursorImageURL{URL: url},
+					})
+				}
+			}
+		}
+
+	case []interface{}:
+		for _, item := range content {
+			partMap, ok := item.(map[string]interface{})
+			if !ok {
+				continue
+			}
+
+			partType := strings.ToLower(strings.TrimSpace(toString(partMap["type"])))
+			switch partType {
+			case "text", "input_text":
+				text := strings.TrimSpace(toString(partMap["text"]))
+				if text != "" {
+					parts = append(parts, CursorPart{Type: "text", Text: text})
+				}
+			case "image_url", "input_image", "image":
+				if url := extractImageURL(partMap); url != "" {
+					parts = append(parts, CursorPart{
+						Type:     "image_url",
+						ImageURL: &CursorImageURL{URL: url},
+					})
+				}
+			default:
+				if url := extractImageURL(partMap); url != "" {
+					parts = append(parts, CursorPart{
+						Type:     "image_url",
+						ImageURL: &CursorImageURL{URL: url},
+					})
+				}
+			}
+		}
+	}
+
+	parts = appendImageParts(parts, collectMessageLevelImageURLs(msg))
+	if len(parts) > 0 {
+		return parts
+	}
+
+	fallback := msg.GetStringContent()
+	if fallback != "" {
+		return []CursorPart{{Type: "text", Text: fallback}}
+	}
+	return []CursorPart{{Type: "text", Text: ""}}
+}
+
+func extractImageURLFromContentPart(part ContentPart) string {
+	if raw := strings.TrimSpace(part.URL); raw != "" {
+		return raw
+	}
+	if len(part.ImageURL) > 0 {
+		if url := extractURLField(part.ImageURL); url != "" {
+			return url
+		}
+	}
+	if strings.TrimSpace(part.Image) != "" {
+		imageValue := strings.TrimSpace(part.Image)
+		lower := strings.ToLower(imageValue)
+		if strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://") || strings.HasPrefix(lower, "data:image/") {
+			return imageValue
+		}
+		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(part.MediaType)), "image/") {
+			return "data:" + strings.TrimSpace(part.MediaType) + ";base64," + imageValue
+		}
+	}
+	if len(part.Source) > 0 {
+		if url := extractImageURL(part.Source); url != "" {
+			return url
+		}
+	}
+	return ""
+}
+
+func extractImageURL(partMap map[string]interface{}) string {
+	// OpenAI-compatible: {"type":"image_url","image_url":{"url":"data:image/..."}}
+	if raw, ok := partMap["image_url"]; ok {
+		if url := extractURLField(raw); url != "" {
+			return url
+		}
+	}
+	if raw, ok := partMap["input_image"]; ok {
+		if url := extractURLField(raw); url != "" {
+			return url
+		}
+	}
+
+	// Some clients send {"type":"image_url","url":"..."}
+	if raw, ok := partMap["url"]; ok {
+		if url := strings.TrimSpace(toString(raw)); url != "" {
+			return url
+		}
+	}
+	if raw, ok := partMap["href"]; ok {
+		if url := strings.TrimSpace(toString(raw)); url != "" {
+			return url
+		}
+	}
+
+	// AI SDK-like image part: {"type":"image","image":"...","mediaType":"image/png"}
+	if raw, ok := partMap["image"]; ok {
+		imageValue := strings.TrimSpace(toString(raw))
+		if imageValue != "" {
+			lower := strings.ToLower(imageValue)
+			if strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://") || strings.HasPrefix(lower, "data:image/") {
+				return imageValue
+			}
+			mediaType := extractMediaType(partMap)
+			if strings.HasPrefix(strings.ToLower(mediaType), "image/") {
+				return "data:" + mediaType + ";base64," + imageValue
+			}
+		}
+	}
+
+	// Anthropic-like image source: {"type":"image","source":{"type":"base64","media_type":"image/png","data":"..."}}
+	if rawSource, ok := partMap["source"]; ok {
+		if source, ok := rawSource.(map[string]interface{}); ok {
+			mediaType := strings.TrimSpace(toString(source["media_type"]))
+			if mediaType == "" {
+				mediaType = strings.TrimSpace(toString(source["mediaType"]))
+			}
+			data := strings.TrimSpace(toString(source["data"]))
+			if mediaType != "" && data != "" {
+				return "data:" + mediaType + ";base64," + data
+			}
+		}
+	}
+
+	return ""
+}
+
+func extractMediaType(partMap map[string]interface{}) string {
+	for _, key := range []string{"media_type", "mediaType", "mime_type", "mimeType"} {
+		if raw, ok := partMap[key]; ok {
+			if v := strings.TrimSpace(toString(raw)); v != "" {
+				return v
+			}
+		}
+	}
+	return ""
+}
+
+func extractURLField(raw interface{}) string {
+	switch typed := raw.(type) {
+	case string:
+		return strings.TrimSpace(typed)
+	case map[string]interface{}:
+		if url, ok := typed["url"]; ok {
+			return strings.TrimSpace(toString(url))
+		}
+	case ContentPart:
+		return strings.TrimSpace(typed.URL)
+	case *ContentPart:
+		if typed != nil {
+			return strings.TrimSpace(typed.URL)
+		}
+	}
+	return ""
+}
+
+func collectMessageLevelImageURLs(msg Message) []string {
+	urls := make([]string, 0, len(msg.Images)+4)
+
+	for _, raw := range msg.Images {
+		if parsed := strings.TrimSpace(raw); parsed != "" {
+			urls = append(urls, parsed)
+		}
+	}
+	if parsed := extractURLField(msg.ImageURL); parsed != "" {
+		urls = append(urls, parsed)
+	}
+	if parsed := extractURLField(msg.InputImage); parsed != "" {
+		urls = append(urls, parsed)
+	}
+
+	for _, raw := range msg.Attachments {
+		if parsed := extractImageURLFromAny(raw); parsed != "" {
+			urls = append(urls, parsed)
+		}
+	}
+	for _, raw := range msg.Files {
+		if parsed := extractImageURLFromAny(raw); parsed != "" {
+			urls = append(urls, parsed)
+		}
+	}
+
+	return uniqueNonEmptyStrings(urls)
+}
+
+func extractImageURLFromAny(raw interface{}) string {
+	switch typed := raw.(type) {
+	case string:
+		return strings.TrimSpace(typed)
+	case map[string]interface{}:
+		if url := extractURLField(typed["image_url"]); url != "" {
+			return url
+		}
+		if url := extractURLField(typed["input_image"]); url != "" {
+			return url
+		}
+		if url := extractURLField(typed["url"]); url != "" {
+			return url
+		}
+		if url := extractURLField(typed["href"]); url != "" {
+			return url
+		}
+		if dataURL := extractImageURL(typed); dataURL != "" {
+			return dataURL
+		}
+	}
+	return ""
+}
+
+func appendImageParts(parts []CursorPart, urls []string) []CursorPart {
+	if len(urls) == 0 {
+		return parts
+	}
+	seen := make(map[string]struct{}, len(parts)+len(urls))
+	for _, part := range parts {
+		if part.ImageURL == nil {
+			continue
+		}
+		key := strings.TrimSpace(part.ImageURL.URL)
+		if key != "" {
+			seen[key] = struct{}{}
+		}
+	}
+	for _, raw := range urls {
+		key := strings.TrimSpace(raw)
+		if key == "" {
+			continue
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		parts = append(parts, CursorPart{
+			Type:     "image_url",
+			ImageURL: &CursorImageURL{URL: key},
+		})
+	}
+	return parts
+}
+
+func uniqueNonEmptyStrings(items []string) []string {
+	seen := make(map[string]struct{}, len(items))
+	result := make([]string, 0, len(items))
+	for _, item := range items {
+		key := strings.TrimSpace(item)
+		if key == "" {
+			continue
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		result = append(result, key)
+	}
+	return result
+}
+
+func toString(v interface{}) string {
+	switch typed := v.(type) {
+	case string:
+		return typed
+	case json.Number:
+		return typed.String()
+	default:
+		if typed == nil {
+			return ""
+		}
+		data, err := json.Marshal(typed)
+		if err != nil {
+			return ""
+		}
+		return string(data)
+	}
 }
 
 // NewChatCompletionResponse 创建聊天完成响应
